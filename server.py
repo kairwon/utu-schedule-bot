@@ -1258,13 +1258,16 @@ def _handle_card_action(sender_id, action):
     # ── 显示主菜单 ──
     if card_action == "show_main":
         send_feishu_card(sender_id, build_main_card(attendance, sd.get("excluded_teachers", {}), students))
-        return jsonify({"ok": True})
+        return jsonify({"toast": {"type": "info", "content": "已刷新"}})
 
-    # ── 开始选学生：发送选学生卡片 ──
+    # ── 开始选学生：发送学生编号列表 ──
     if card_action == "start_select":
         user_sessions[sender_id] = {"state": "selecting", "current_slot": slot}
-        send_feishu_card(sender_id, build_select_card(slot, students, attendance, sd.get("excluded_teachers", {})))
-        return jsonify({"ok": True})
+        # 发送学生列表文本（不用卡片，避免嵌套复杂）
+        reply = f"📋 请回复 **[{slot}]** 的学生编号：\n\n" + format_student_list(students)
+        reply += f"\n\n💡 输入编号（逗号分隔）如：1,3,5,7  或输入「全部」"
+        send_feishu_msg(sender_id, reply)
+        return jsonify({"toast": {"type": "info", "content": f"为 {slot} 选学生"}})
 
     # ── 快速操作：全选/清空 ──
     if card_action == "quick_select":
@@ -1284,37 +1287,36 @@ def _handle_card_action(sender_id, action):
         # 刷新选学生卡片
         send_feishu_card(sender_id, build_select_card(slot, sd["students"],
             sd.get("attendance", {}), sd.get("excluded_teachers", {})))
-        return jsonify({"ok": True})
+        return jsonify({"toast": {"type": "success", "content": reply}})
 
-    # ── 确认选择（多选框的值通过 option 返回） ──
+    # ── 确认选择 → 通过文字回复 ──
     if card_action == "confirm_select":
-        # Feishu multi_select_static 的选中值在 action.option 或 action.value 中
-        # 但如果通过 confirm 按钮提交，选中值在 action 之外
-        # 实际上 multi_select_static 的选择无法直接传给 button...
-        # 所以改用另一种方式：让用户点了确认后通过文字回复
         user_sessions[sender_id] = {"state": "confirming", "current_slot": slot}
         send_feishu_msg(sender_id,
             f"📋 请回复 **[{slot}]** 的学生名单：\n\n"
             + format_student_list(students)
             + f"\n\n输入学生**编号**或**名字**（逗号分隔），例如：1,3,5,7\n或输入「全部」选所有学生"
         )
-        return jsonify({"ok": True})
+        return jsonify({"toast": {"type": "info", "content": f"请在聊天框回复 {slot} 的学生"}})
 
     # ── 查看学生列表 ──
     if card_action == "list_students":
         reply = f"📋 学生列表（共 {len(students)} 人）：\n\n" + format_student_list(students) if students else "📭 暂无学生"
         send_feishu_msg(sender_id, reply)
-        return jsonify({"ok": True})
+        return jsonify({"toast": {"type": "info", "content": "已发送学生列表"}})
 
     # ── 自动排课 ──
     if card_action == "auto_schedule":
-        return _handle_text_msg(sender_id, "自动排课")
+        send_feishu_msg(sender_id, "🚀 正在排课...")
+        _handle_text_msg(sender_id, "自动排课")
+        return jsonify({"toast": {"type": "info", "content": "正在排课..."}})
 
     # ── 查看课表 ──
     if card_action == "query_day":
-        return _handle_text_msg(sender_id, "查看今天课表")
+        _handle_text_msg(sender_id, "查看今天课表")
+        return jsonify({"toast": {"type": "info", "content": "查看课表"}})
 
-    return jsonify({"ok": True})
+    return jsonify({"toast": {"type": "error", "content": f"未知操作: {card_action}"}})
 
 def _handle_text_msg(sender_id, user_msg):
     """处理文字消息"""
