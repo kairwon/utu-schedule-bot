@@ -120,18 +120,33 @@ def send_feishu_card(open_id: str, card_json: dict):
     return result
 
 def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
-    """构建主菜单卡片——选学生 + 排课入口"""
+    """构建信息卡片——展示当前状态，无按钮（纯文字指令替代）"""
     today = datetime.now().strftime("%Y-%m-%d")
     day_att = attendance.get(today, {})
     day_exc = excluded.get(today, [])
 
-    # 计算各时段人数
-    counts = {}
-    for slot in TIME_SLOTS:
+    # 各时段学生
+    lines = [f"**{today} 学生考勤**"]
+    for i, slot in enumerate(TIME_SLOTS):
         names = day_att.get(slot, [])
-        counts[slot] = len(names)
+        if names:
+            lines.append(f"  {i+1}  [{slot}] {len(names)}人：{', '.join(names)}")
+        else:
+            lines.append(f"  {i+1}  [{slot}] （未选）")
 
-    total_selected = sum(counts.values())
+    total = sum(len(day_att.get(s, [])) for s in TIME_SLOTS)
+    lines.append(f"\n**共 {total}/{len(students)} 人**")
+
+    if day_exc:
+        lines.append(f"\n🚫 排除：{', '.join(day_exc)}")
+
+    lines.append(f"\n━━━━━━━━━━━━━━━━")
+    lines.append(f"💡 **常用指令**：")
+    lines.append(f"  选学生：`9:30-11:30: David, Yufei, Eva`")
+    lines.append(f"  全选：`9:30-11:30: 全部`")
+    lines.append(f"  排课：`自动排课`")
+    lines.append(f"  排除老师：`Tere 今天不排`")
+    lines.append(f"  查课表：`查看今天课表`")
 
     return {
         "config": {"wide_screen_mode": True},
@@ -140,92 +155,23 @@ def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
             "template": "blue"
         },
         "elements": [
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md",
-                    "content": f"**{today}**  \n已选 {total_selected}/{len(students)} 人" +
-                               (f"  |  🚫 {', '.join(day_exc)}" if day_exc else "")}
-            },
-            {"tag": "hr"},
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": "**👇 选择各时段学生**"}
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": f"① 9:30-11:30 ({counts[TIME_SLOTS[0]]}人)"},
-                        "type": "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[0]})
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": f"② 12:30-14:30 ({counts[TIME_SLOTS[1]]}人)"},
-                        "type": "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[1]})
-                    }
-                ]
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": f"③ 14:30-16:30 ({counts[TIME_SLOTS[2]]}人)"},
-                        "type": "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[2]})
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": f"④ 16:30-18:40 ({counts[TIME_SLOTS[3]]}人)"},
-                        "type": "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[3]})
-                    }
-                ]
-            },
-            {"tag": "hr"},
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": "👥 全部学生"},
-                        "type": "default",
-                        "value": json.dumps({"action": "list_students"})
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": "🚀 自动排课"},
-                        "type": "primary",
-                        "value": json.dumps({"action": "auto_schedule"})
-                    }
-                ]
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": "📊 查看课表"},
-                        "type": "default",
-                        "value": json.dumps({"action": "query_day"})
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "lark_md", "content": "🔄 刷新"},
-                        "type": "default",
-                        "value": json.dumps({"action": "show_main"})
-                    }
-                ]
-            },
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}},
             {
                 "tag": "note",
-                "elements": [{"tag": "plain_text", "content": "💡 点击时段按钮选学生，选完后点「自动排课」。用文字指令也可以：'9:30-11:30: David, Yufei'"}]
+                "elements": [{"tag": "plain_text",
+                    "content": "💡 发「排课」看此卡片 | 直接发文字指令操作"}]
             }
         ]
     }
+
+
+def _show_main_card(sender_id):
+    """发送主信息卡片"""
+    sd = get_schedule()
+    attendance = sd.get("attendance", {})
+    excluded = sd.get("excluded_teachers", {})
+    students = sd.get("students", [])
+    send_feishu_card(sender_id, build_main_card(attendance, excluded, students))
 
 def build_select_card(slot: str, students: list, attendance: dict, excluded: dict) -> dict:
     """构建选学生卡片——40个选项分两排"""
@@ -1209,9 +1155,8 @@ def feishu_webhook():
     if not sender_id: return jsonify({"ok": True})
 
     # ── 处理卡片按钮点击 ──
-    event_type = body.get("type", "") or event.get("type", "")
     header_type = body.get("header", {}).get("event_type", "")
-    if event_type == "card.action.trigger" or header_type == "card.action.trigger":
+    if header_type == "card.action.trigger":
         return _handle_card_action(sender_id, event.get("action", {}))
 
     # ── 处理消息文字 ──
