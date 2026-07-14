@@ -1201,43 +1201,77 @@ def api_command():
 @app.route("/feishu/webhook", methods=["POST"])
 def feishu_webhook():
     body = request.get_json(force=True)
+
+    # —— 记录所有请求到文件，方便排查 ——
+    log_entry = {
+        "time": datetime.now().isoformat(),
+        "body_keys": list(body.keys()) if body else [],
+        "schema": body.get("schema", ""),
+        "header_type": body.get("header", {}).get("event_type", ""),
+        "body_type": body.get("type", ""),
+    }
+    _write_request_log(log_entry)
+
     if body.get("type") == "url_verification":
         return jsonify({"challenge": body.get("challenge", "")})
 
     event = body.get("event", {})
-    if not event: return jsonify({"ok": True})
+    if not event:
+        _write_request_log({"error": "no event field", "body": str(body)[:500]})
+        return jsonify({"ok": True})
 
-    # 卡片事件的 open_id 可能在 event.open_id 或 event.sender.sender_id.open_id
+    # 多种方式提取 sender_id
     sender_id = (event.get("open_id", "") or
                  event.get("sender", {}).get("sender_id", {}).get("open_id", "") or
                  event.get("operator", {}).get("open_id", ""))
-    if not sender_id: return jsonify({"ok": True})
+
+    _write_request_log({"sender_found": bool(sender_id), "sender_id": sender_id[:20] if sender_id else "NONE"})
+
+    if not sender_id:
+        _write_request_log({"error": "no sender_id", "event_keys": list(event.keys())})
+        return jsonify({"ok": True})
 
     # ── 处理卡片按钮点击 ──
     header_type = body.get("header", {}).get("event_type", "")
-    # 也检查 schema 版本
     schema = body.get("schema", "")
-    if header_type == "card.action.trigger" or schema.startswith("2."):
-        print(f"[飞书] 卡片事件: header_type={header_type}, schema={schema}")
-        print(f"[飞书] action: {json.dumps(event.get('action', {}), ensure_ascii=False)[:500]}")
+    is_card_event = (header_type == "card.action.trigger" or schema.startswith("2."))
+
+    _write_request_log({"is_card_event": is_card_event, "has_message": "message" in event})
+
+    if is_card_event:
+        _write_request_log({"card_action": str(event.get("action", {}))[:300]})
         return _handle_card_action(sender_id, event.get("action", {}))
 
     # ── 处理消息文字 ──
     msg = event.get("message", {})
-    print(f"[飞书] 非卡片事件: type={body.get('type','?')}, header_type={header_type}, msg_type={msg.get('message_type','?')}")
     if msg.get("message_type") != "text":
+        _write_request_log({"skipped": f"msg_type={msg.get('message_type')}"})
         return jsonify({"ok": True})
 
     try:
-        user_msg = json.loads(msg.get("content", "{}")).get("text", "").strip()
+        content = json.loads(msg.get("content", "{}"))
+        user_msg = content.get("text", "").strip()
     except:
+        _write_request_log({"error": "failed to parse msg content"})
         return jsonify({"ok": True})
-    if not user_msg: return jsonify({"ok": True})
+
+    if not user_msg:
+        return jsonify({"ok": True})
     if user_msg.startswith("@"):
         parts = user_msg.split(" ", 1)
         user_msg = parts[1] if len(parts) > 1 else ""
 
+    _write_request_log({"user_msg": user_msg[:100]})
     return _handle_text_msg(sender_id, user_msg)
+
+def _write_request_log(entry: dict):
+    """写入请求日志"""
+    try:
+        log_path = DATA_DIR / "webhook_log.jsonl"
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except:
+        pass
 
 def _handle_card_action(sender_id, action):
     """处理卡片按钮点击"""
@@ -1381,6 +1415,15 @@ def _do_handle_text(sender_id, user_msg):
     return jsonify({"ok": True})
 
 # ──────────────────────── 启动 ────────────────────────
+
+@app.route("/debug/logs", methods=["GET"])
+def debug_logs():
+    """查看最近的 webhook 请求日志"""
+    log_path = DATA_DIR / "webhook_log.jsonl"
+    if not log_path.exists():
+        return jsonify({"logs": [], "msg": "还没有任何请求"})
+    lines = log_path.read_text().strip().split("\n")[-50:]  # 最近50条
+    return jsonify({"logs": [json.loads(l) for l in lines if l]})
 
 @app.route("/", methods=["GET"])
 def health():
