@@ -1262,6 +1262,16 @@ def _handle_card_action(sender_id, action):
 
 def _handle_text_msg(sender_id, user_msg):
     """处理文字消息"""
+    try:
+        return _do_handle_text(sender_id, user_msg)
+    except Exception as e:
+        import traceback
+        err_msg = f"⚠️ 服务器内部错误: {str(e)[:200]}"
+        print(f"[错误] {traceback.format_exc()}")
+        send_feishu_msg(sender_id, err_msg)
+        return jsonify({"ok": True})
+
+def _do_handle_text(sender_id, user_msg):
     sd = get_schedule()
     today = datetime.now().strftime("%Y-%m-%d")
 
