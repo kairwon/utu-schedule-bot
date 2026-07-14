@@ -1151,7 +1151,10 @@ def feishu_webhook():
     event = body.get("event", {})
     if not event: return jsonify({"ok": True})
 
-    sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
+    # 卡片事件的 open_id 可能在 event.open_id 或 event.sender.sender_id.open_id
+    sender_id = (event.get("open_id", "") or
+                 event.get("sender", {}).get("sender_id", {}).get("open_id", "") or
+                 event.get("operator", {}).get("open_id", ""))
     if not sender_id: return jsonify({"ok": True})
 
     # ── 处理卡片按钮点击 ──
