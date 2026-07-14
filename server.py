@@ -120,33 +120,23 @@ def send_feishu_card(open_id: str, card_json: dict):
     return result
 
 def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
-    """构建信息卡片——展示当前状态，无按钮（纯文字指令替代）"""
+    """构建主菜单卡片（带按钮）"""
     today = datetime.now().strftime("%Y-%m-%d")
     day_att = attendance.get(today, {})
     day_exc = excluded.get(today, [])
 
-    # 各时段学生
-    lines = [f"**{today} 学生考勤**"]
+    # 各时段人数
+    counts = {}
+    for slot in TIME_SLOTS:
+        counts[slot] = len(day_att.get(slot, []))
+    total = sum(counts.values())
+
+    status_lines = [f"**{today}**　已选 **{total}/{len(students)}** 人"]
+    if day_exc:
+        status_lines.append(f"🚫 排除老师：{', '.join(day_exc)}")
     for i, slot in enumerate(TIME_SLOTS):
         names = day_att.get(slot, [])
-        if names:
-            lines.append(f"  {i+1}  [{slot}] {len(names)}人：{', '.join(names)}")
-        else:
-            lines.append(f"  {i+1}  [{slot}] （未选）")
-
-    total = sum(len(day_att.get(s, [])) for s in TIME_SLOTS)
-    lines.append(f"\n**共 {total}/{len(students)} 人**")
-
-    if day_exc:
-        lines.append(f"\n🚫 排除：{', '.join(day_exc)}")
-
-    lines.append(f"\n━━━━━━━━━━━━━━━━")
-    lines.append(f"💡 **常用指令**：")
-    lines.append(f"  选学生：`9:30-11:30: David, Yufei, Eva`")
-    lines.append(f"  全选：`9:30-11:30: 全部`")
-    lines.append(f"  排课：`自动排课`")
-    lines.append(f"  排除老师：`Tere 今天不排`")
-    lines.append(f"  查课表：`查看今天课表`")
+        status_lines.append(f"  {i+1} [{slot}] {counts[slot]}人" + (f"：{', '.join(names)}" if names else ""))
 
     return {
         "config": {"wide_screen_mode": True},
@@ -155,11 +145,77 @@ def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
             "template": "blue"
         },
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(status_lines)}},
+            {"tag": "hr"},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "**👇 点击时段选学生**"}},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"① 9:30-11:30（{counts[TIME_SLOTS[0]]}人）"},
+                        "type": "primary" if counts[TIME_SLOTS[0]] == 0 else "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[0]})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"② 12:30-14:30（{counts[TIME_SLOTS[1]]}人）"},
+                        "type": "primary" if counts[TIME_SLOTS[1]] == 0 else "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[1]})
+                    }
+                ]
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"③ 14:30-16:30（{counts[TIME_SLOTS[2]]}人）"},
+                        "type": "primary" if counts[TIME_SLOTS[2]] == 0 else "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[2]})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"④ 16:30-18:40（{counts[TIME_SLOTS[3]]}人）"},
+                        "type": "primary" if counts[TIME_SLOTS[3]] == 0 else "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[3]})
+                    }
+                ]
+            },
+            {"tag": "hr"},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "👥 学生列表"},
+                        "type": "default",
+                        "value": json.dumps({"action": "list_students"})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "🚀 自动排课"},
+                        "type": "primary",
+                        "value": json.dumps({"action": "auto_schedule"})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "📊 查看课表"},
+                        "type": "default",
+                        "value": json.dumps({"action": "query_day"})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "🔄 刷新"},
+                        "type": "default",
+                        "value": json.dumps({"action": "show_main"})
+                    }
+                ]
+            },
             {
                 "tag": "note",
                 "elements": [{"tag": "plain_text",
-                    "content": "💡 发「排课」看此卡片 | 直接发文字指令操作"}]
+                    "content": "💡 点时段按钮选学生 → 回复编号 → 再点「自动排课」。也可直接发文字指令。"}]
             }
         ]
     }
@@ -1296,7 +1352,7 @@ def _do_handle_text(sender_id, user_msg):
         # 不是学生名单，当作普通指令处理（fall through）
 
     # ── 快捷指令：直接发卡片 ──
-    if user_msg.strip() in ("菜单", "选学生", "开始", "排课", "排课菜单", "hi", "hello", "你好", "在吗"):
+    if user_msg.strip() in ("菜单", "选学生", "开始", "排课", "排课菜单"):
         send_feishu_card(sender_id, build_main_card(
             sd.get("attendance", {}), sd.get("excluded_teachers", {}), sd.get("students", [])))
         return jsonify({"ok": True})
