@@ -51,6 +51,9 @@ anthropic = Anthropic(
 
 FEISHU_HOST = "https://open.feishu.cn"
 
+# 用户会话状态（记住用户在做什么）
+user_sessions = {}  # {open_id: {"state": "selecting_slot"|None, "current_slot": "09:30-11:30"}}
+
 TIME_SLOTS = ["09:30-11:30", "12:30-14:30", "14:30-16:30", "16:30-18:40"]
 ROOM_LIST  = [f"Room {i}" for i in range(1, 31) if i not in (9, 11)]
 ENGLISH_SUBS = {"vocabulary","1000","2000","4000","grammar","ielts","phonics","esl"}
@@ -102,6 +105,218 @@ def send_feishu_msg(open_id: str, text: str):
     if result.get("code") != 0:
         print(f"[飞书] 发送失败: {result}")
     return result
+
+def send_feishu_card(open_id: str, card_json: dict):
+    """发送飞书交互式卡片消息"""
+    token = get_tenant_token()
+    resp = requests.post(
+        f"{FEISHU_HOST}/open-apis/im/v1/messages?receive_id_type=open_id",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"receive_id": open_id, "msg_type": "interactive", "content": json.dumps(card_json, ensure_ascii=False)},
+        timeout=10)
+    result = resp.json()
+    if result.get("code") != 0:
+        print(f"[飞书] 卡片发送失败: {result}")
+    return result
+
+def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
+    """构建主菜单卡片——选学生 + 排课入口"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    day_att = attendance.get(today, {})
+    day_exc = excluded.get(today, [])
+
+    # 计算各时段人数
+    counts = {}
+    for slot in TIME_SLOTS:
+        names = day_att.get(slot, [])
+        counts[slot] = len(names)
+
+    total_selected = sum(counts.values())
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "📋 UTU 排课系统"},
+            "template": "blue"
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md",
+                    "content": f"**{today}**  \n已选 {total_selected}/{len(students)} 人" +
+                               (f"  |  🚫 {', '.join(day_exc)}" if day_exc else "")}
+            },
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "**👇 选择各时段学生**"}
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"① 9:30-11:30 ({counts[TIME_SLOTS[0]]}人)"},
+                        "type": "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[0]})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"② 12:30-14:30 ({counts[TIME_SLOTS[1]]}人)"},
+                        "type": "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[1]})
+                    }
+                ]
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"③ 14:30-16:30 ({counts[TIME_SLOTS[2]]}人)"},
+                        "type": "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[2]})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": f"④ 16:30-18:40 ({counts[TIME_SLOTS[3]]}人)"},
+                        "type": "default",
+                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[3]})
+                    }
+                ]
+            },
+            {"tag": "hr"},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "👥 全部学生"},
+                        "type": "default",
+                        "value": json.dumps({"action": "list_students"})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "🚀 自动排课"},
+                        "type": "primary",
+                        "value": json.dumps({"action": "auto_schedule"})
+                    }
+                ]
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "📊 查看课表"},
+                        "type": "default",
+                        "value": json.dumps({"action": "query_day"})
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "lark_md", "content": "🔄 刷新"},
+                        "type": "default",
+                        "value": json.dumps({"action": "show_main"})
+                    }
+                ]
+            },
+            {
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": "💡 点击时段按钮选学生，选完后点「自动排课」。用文字指令也可以：'9:30-11:30: David, Yufei'"}]
+            }
+        ]
+    }
+
+def build_select_card(slot: str, students: list, attendance: dict, excluded: dict) -> dict:
+    """构建选学生卡片——40个选项分两排"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    day_att = attendance.get(today, {})
+    already = set(day_att.get(slot, []))
+
+    # 学生选项（带科目信息）
+    options = []
+    for s in students:
+        label = f"{s['Student']} | G{s['Grade']} | {s['Subject']}"
+        options.append({
+            "value": s["Student"],
+            "text": {"tag": "plain_text", "content": label}
+        })
+
+    # 预先勾选已有的学生
+    initial_selected = [s for s in already if s in {st['Student'] for st in students}]
+
+    elements = [
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"**选择 [{slot}] 的学生**\n选完后点底部「✅ 确认」按钮"}
+        },
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "multi_select_static",
+                    "placeholder": {"tag": "plain_text", "content": f"选择 {slot} 的学生"},
+                    "initial_options": initial_selected[:50],
+                    "options": options[:100],
+                    "value": {"key": "student_list"}
+                }
+            ]
+        },
+        {"tag": "hr"},
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "lark_md", "content": "✅ 确认选择"},
+                    "type": "primary",
+                    "value": json.dumps({"action": "confirm_select", "slot": slot}),
+                    "confirm": {
+                        "title": {"tag": "plain_text", "content": "确认选择？"},
+                        "text": {"tag": "plain_text", "content": f"将更新 [{slot}] 的学生名单"}
+                    }
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "lark_md", "content": "全部学生"},
+                    "type": "default",
+                    "value": json.dumps({"action": "quick_select", "slot": slot, "mode": "all"})
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "lark_md", "content": "清空此时段"},
+                    "type": "danger",
+                    "value": json.dumps({"action": "quick_select", "slot": slot, "mode": "clear"})
+                }
+            ]
+        },
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "lark_md", "content": "🔙 返回主菜单"},
+                    "type": "default",
+                    "value": json.dumps({"action": "show_main"})
+                }
+            ]
+        },
+        {
+            "tag": "note",
+            "elements": [{"tag": "plain_text",
+                "content": f"💡 如果多选框不好用，直接发文字：'{slot}: 学生名1, 学生名2' 即可"}]
+        }
+    ]
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"✏️ 选学生 - {slot}"},
+            "template": "green"
+        },
+        "elements": elements
+    }
+
 
 # ──────────────────────────── 排课算法核心 ────────────────────────────
 
@@ -990,6 +1205,16 @@ def feishu_webhook():
     event = body.get("event", {})
     if not event: return jsonify({"ok": True})
 
+    sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
+    if not sender_id: return jsonify({"ok": True})
+
+    # ── 处理卡片按钮点击 ──
+    event_type = body.get("type", "") or event.get("type", "")
+    header_type = body.get("header", {}).get("event_type", "")
+    if event_type == "card.action.trigger" or header_type == "card.action.trigger":
+        return _handle_card_action(sender_id, event.get("action", {}))
+
+    # ── 处理消息文字 ──
     msg = event.get("message", {})
     if msg.get("message_type") != "text":
         return jsonify({"ok": True})
@@ -1003,12 +1228,118 @@ def feishu_webhook():
         parts = user_msg.split(" ", 1)
         user_msg = parts[1] if len(parts) > 1 else ""
 
-    sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
-    if not sender_id: return jsonify({"ok": True})
+    return _handle_text_msg(sender_id, user_msg)
 
-    print(f"[飞书] 说: {user_msg[:100]}")
+def _handle_card_action(sender_id, action):
+    """处理卡片按钮点击"""
+    try:
+        value = json.loads(action.get("value", "{}"))
+    except:
+        value = {}
+
+    card_action = value.get("action", "")
+    slot = value.get("slot", "")
+    mode = value.get("mode", "")
 
     sd = get_schedule()
+    today = datetime.now().strftime("%Y-%m-%d")
+    attendance = sd.get("attendance", {})
+    students = sd.get("students", [])
+
+    # ── 显示主菜单 ──
+    if card_action == "show_main":
+        send_feishu_card(sender_id, build_main_card(attendance, sd.get("excluded_teachers", {}), students))
+        return jsonify({"ok": True})
+
+    # ── 开始选学生：发送选学生卡片 ──
+    if card_action == "start_select":
+        user_sessions[sender_id] = {"state": "selecting", "current_slot": slot}
+        send_feishu_card(sender_id, build_select_card(slot, students, attendance, sd.get("excluded_teachers", {})))
+        return jsonify({"ok": True})
+
+    # ── 快速操作：全选/清空 ──
+    if card_action == "quick_select":
+        day_att = attendance.setdefault(today, {})
+        if mode == "all":
+            day_att[slot] = [s['Student'] for s in students]
+            reply = f"✅ [{slot}] 已选全部 {len(students)} 人"
+        elif mode == "clear":
+            if slot in day_att:
+                del day_att[slot]
+            reply = f"✅ [{slot}] 已清空"
+        else:
+            reply = "⚠️ 未知操作"
+        save_schedule(sd)
+        send_feishu_msg(sender_id, reply)
+
+        # 刷新选学生卡片
+        send_feishu_card(sender_id, build_select_card(slot, sd["students"],
+            sd.get("attendance", {}), sd.get("excluded_teachers", {})))
+        return jsonify({"ok": True})
+
+    # ── 确认选择（多选框的值通过 option 返回） ──
+    if card_action == "confirm_select":
+        # Feishu multi_select_static 的选中值在 action.option 或 action.value 中
+        # 但如果通过 confirm 按钮提交，选中值在 action 之外
+        # 实际上 multi_select_static 的选择无法直接传给 button...
+        # 所以改用另一种方式：让用户点了确认后通过文字回复
+        user_sessions[sender_id] = {"state": "confirming", "current_slot": slot}
+        send_feishu_msg(sender_id,
+            f"📋 请回复 **[{slot}]** 的学生名单：\n\n"
+            + format_student_list(students)
+            + f"\n\n输入学生**编号**或**名字**（逗号分隔），例如：1,3,5,7\n或输入「全部」选所有学生"
+        )
+        return jsonify({"ok": True})
+
+    # ── 查看学生列表 ──
+    if card_action == "list_students":
+        reply = f"📋 学生列表（共 {len(students)} 人）：\n\n" + format_student_list(students) if students else "📭 暂无学生"
+        send_feishu_msg(sender_id, reply)
+        return jsonify({"ok": True})
+
+    # ── 自动排课 ──
+    if card_action == "auto_schedule":
+        return _handle_text_msg(sender_id, "自动排课")
+
+    # ── 查看课表 ──
+    if card_action == "query_day":
+        return _handle_text_msg(sender_id, "查看今天课表")
+
+    return jsonify({"ok": True})
+
+def _handle_text_msg(sender_id, user_msg):
+    """处理文字消息"""
+    sd = get_schedule()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # ── 如果用户在选学生流程中，智能解析 ──
+    session = user_sessions.get(sender_id, {})
+    if session.get("state") in ("selecting", "confirming") and session.get("current_slot"):
+        slot = session["current_slot"]
+        # 用户可能回复学生编号或名字
+        students = sd.get("students", [])
+        selected = _parse_names(user_msg, students)
+
+        if selected:
+            sd.setdefault("attendance", {}).setdefault(today, {})[slot] = selected
+            save_schedule(sd)
+            user_sessions.pop(sender_id, None)
+            reply = f"✅ [{slot}] 已选 {len(selected)} 人：{', '.join(selected)}\n\n" + \
+                    format_attendance(sd.get("attendance", {}), students, sd.get("excluded_teachers", {}))
+            send_feishu_msg(sender_id, reply)
+            # 也刷新卡片
+            send_feishu_card(sender_id, build_main_card(sd.get("attendance", {}), sd.get("excluded_teachers", {}), students))
+            return jsonify({"ok": True})
+        # 不是学生名单，当作普通指令处理（fall through）
+
+    # ── 快捷指令：直接发卡片 ──
+    if user_msg.strip() in ("菜单", "选学生", "开始", "排课菜单", "hi", "hello", "你好", "在吗"):
+        send_feishu_card(sender_id, build_main_card(
+            sd.get("attendance", {}), sd.get("excluded_teachers", {}), sd.get("students", [])))
+        return jsonify({"ok": True})
+
+    # ── 正常 AI 处理 ──
+    print(f"[飞书] {sender_id[:8]}... 说: {user_msg[:100]}")
     op = parse_command(user_msg, sd)
     reply, updated = execute_operation(sd, op)
     save_schedule(updated)
@@ -1017,6 +1348,15 @@ def feishu_webhook():
         reply = reply[:4500] + "\n\n...（截断）"
 
     send_feishu_msg(sender_id, reply)
+
+    # 如果有考勤/排课变化，刷新主卡片
+    if op.get("action") in ("select_students", "auto_schedule", "exclude_teacher",
+                             "include_teacher", "add_student", "remove_student", "clear_slot"):
+        attendance = updated.get("attendance", {})
+        students = updated.get("students", [])
+        excluded = updated.get("excluded_teachers", {})
+        send_feishu_card(sender_id, build_main_card(attendance, excluded, students))
+
     return jsonify({"ok": True})
 
 # ──────────────────────── 启动 ────────────────────────
