@@ -120,12 +120,11 @@ def send_feishu_card(open_id: str, card_json: dict):
     return result
 
 def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
-    """构建主菜单卡片（带按钮）"""
+    """构建主菜单卡片（带按钮）—— 按钮值用简单字符串避免JSON编码问题"""
     today = datetime.now().strftime("%Y-%m-%d")
     day_att = attendance.get(today, {})
     day_exc = excluded.get(today, [])
 
-    # 各时段人数
     counts = {}
     for slot in TIME_SLOTS:
         counts[slot] = len(day_att.get(slot, []))
@@ -137,6 +136,9 @@ def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
     for i, slot in enumerate(TIME_SLOTS):
         names = day_att.get(slot, [])
         status_lines.append(f"  {i+1} [{slot}] {counts[slot]}人" + (f"：{', '.join(names)}" if names else ""))
+
+    def slot_val(s): return f"slot:{s}"
+    def quick_val(s, m): return f"quick:{s}:{m}"
 
     return {
         "config": {"wide_screen_mode": True},
@@ -155,13 +157,13 @@ def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": f"① 9:30-11:30（{counts[TIME_SLOTS[0]]}人）"},
                         "type": "primary" if counts[TIME_SLOTS[0]] == 0 else "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[0]})
+                        "value": slot_val(TIME_SLOTS[0])
                     },
                     {
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": f"② 12:30-14:30（{counts[TIME_SLOTS[1]]}人）"},
                         "type": "primary" if counts[TIME_SLOTS[1]] == 0 else "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[1]})
+                        "value": slot_val(TIME_SLOTS[1])
                     }
                 ]
             },
@@ -172,13 +174,13 @@ def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": f"③ 14:30-16:30（{counts[TIME_SLOTS[2]]}人）"},
                         "type": "primary" if counts[TIME_SLOTS[2]] == 0 else "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[2]})
+                        "value": slot_val(TIME_SLOTS[2])
                     },
                     {
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": f"④ 16:30-18:40（{counts[TIME_SLOTS[3]]}人）"},
                         "type": "primary" if counts[TIME_SLOTS[3]] == 0 else "default",
-                        "value": json.dumps({"action": "start_select", "slot": TIME_SLOTS[3]})
+                        "value": slot_val(TIME_SLOTS[3])
                     }
                 ]
             },
@@ -190,32 +192,32 @@ def build_main_card(attendance: dict, excluded: dict, students: list) -> dict:
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": "👥 学生列表"},
                         "type": "default",
-                        "value": json.dumps({"action": "list_students"})
+                        "value": "list_students"
                     },
                     {
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": "🚀 自动排课"},
                         "type": "primary",
-                        "value": json.dumps({"action": "auto_schedule"})
+                        "value": "auto_schedule"
                     },
                     {
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": "📊 查看课表"},
                         "type": "default",
-                        "value": json.dumps({"action": "query_day"})
+                        "value": "query_day"
                     },
                     {
                         "tag": "button",
                         "text": {"tag": "lark_md", "content": "🔄 刷新"},
                         "type": "default",
-                        "value": json.dumps({"action": "show_main"})
+                        "value": "show_main"
                     }
                 ]
             },
             {
                 "tag": "note",
                 "elements": [{"tag": "plain_text",
-                    "content": "💡 点时段按钮选学生 → 回复编号 → 再点「自动排课」。也可直接发文字指令。"}]
+                    "content": "💡 点时段按钮 → 回复学生编号 → 点「自动排课」"}]
             }
         ]
     }
@@ -1274,15 +1276,40 @@ def _write_request_log(entry: dict):
         pass
 
 def _handle_card_action(sender_id, action):
-    """处理卡片按钮点击"""
-    try:
-        value = json.loads(action.get("value", "{}"))
-    except:
-        value = {}
-
-    card_action = value.get("action", "")
-    slot = value.get("slot", "")
-    mode = value.get("mode", "")
+    """处理卡片按钮点击——value 格式: slot:09:30-11:30 / auto_schedule / query_day 等"""
+    raw_value = action.get("value", "")
+    # 兼容旧格式（JSON）和新格式（纯字符串）
+    if isinstance(raw_value, dict):
+        # 已经是 dict
+        card_action = raw_value.get("action", "")
+        slot = raw_value.get("slot", "")
+        mode = raw_value.get("mode", "")
+    elif raw_value.startswith("slot:"):
+        # 新格式: "slot:09:30-11:30"
+        card_action = "start_select"
+        slot = raw_value[5:]
+        mode = ""
+    elif raw_value.startswith("quick:"):
+        # 新格式: "quick:09:30-11:30:all"
+        parts = raw_value.split(":", 3)
+        card_action = "quick_select"
+        slot = parts[1] if len(parts) > 1 else ""
+        mode = parts[2] if len(parts) > 2 else ""
+    elif raw_value in ("auto_schedule", "query_day", "list_students", "show_main"):
+        card_action = raw_value
+        slot = ""
+        mode = ""
+    else:
+        # 可能是旧 JSON 格式
+        try:
+            value = json.loads(raw_value)
+            card_action = value.get("action", "")
+            slot = value.get("slot", "")
+            mode = value.get("mode", "")
+        except:
+            card_action = ""
+            slot = ""
+            mode = ""
 
     sd = get_schedule()
     today = datetime.now().strftime("%Y-%m-%d")
