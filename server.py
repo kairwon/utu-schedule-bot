@@ -1172,6 +1172,11 @@ def parse_command(user_msg: str, schedule_data: dict) -> dict:
 
 # ──────────────────────── API 路由 ────────────────────────
 
+@app.route("/page")
+def serve_page():
+    """手机端排课网页"""
+    return app.send_static_file("schedule.html")
+
 @app.route("/api/schedule", methods=["GET"])
 def api_get_schedule():
     return jsonify(get_schedule())
