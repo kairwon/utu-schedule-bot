@@ -2223,23 +2223,18 @@ function exportPDF() {
       el.style.width = origWidth;
       const imgData=canvas.toDataURL("image/png");
       const {jsPDF}=jspdf;
-      // A4 landscape: 297mm × 210mm
+      // A4 landscape: 297mm × 210mm — 自动缩小适配一页
       const pdf=new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
-      const pw=pdf.internal.pageSize.getWidth(); // 297
-      const ph=pdf.internal.pageSize.getHeight(); // 210
-      const margin=10;
-      const imgW=pw-2*margin; // fill page width
-      const imgH=canvas.height*imgW/canvas.width;
-      const x=margin;
-      let pos=margin; let hLeft=imgH;
-      pdf.addImage(imgData,"PNG",x,pos,imgW,imgH);
-      hLeft-=(ph-2*margin);
-      while(hLeft>0){
-        pdf.addPage();
-        pos=margin-hLeft; // shift image up for continuation
-        pdf.addImage(imgData,"PNG",x,pos,imgW,imgH);
-        hLeft-=(ph-2*margin);
+      const pw=pdf.internal.pageSize.getWidth();
+      const ph=pdf.internal.pageSize.getHeight();
+      const margin=8;
+      let imgW=pw-2*margin;
+      let imgH=canvas.height*imgW/canvas.width;
+      if (imgH > (ph-2*margin) * 1.05) {
+        imgH = (ph-2*margin) * 0.98;
+        imgW = canvas.width * imgH / canvas.height;
       }
+      pdf.addImage(imgData,"PNG",margin,(ph-imgH)/2,imgW,imgH);
       pdf.save(`UTU课表_${date}.pdf`);
     }).catch(err=>{ el.style.width=origWidth; alert("PDF生成失败："+err.message); });
   } catch(err){ alert("PDF导出异常："+err.message); }
