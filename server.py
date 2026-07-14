@@ -2,21 +2,19 @@
 UTU 排课系统 — AI 指令后端
 ===========================
 电脑网页端：不变，照常用 Excel 导入学生/老师，数据同步到服务器
-飞书机器人：手机上选学生、分配时段、增删学生、查询排课
+飞书机器人：手机上选学生、分配时段、增删学生、自动排课
 
 四个时段：
-  ① 09:30-11:30
-  ② 12:30-14:30
-  ③ 14:30-16:30
-  ④ 16:30-18:40
+  ① 09:30-11:30  ② 12:30-14:30  ③ 14:30-16:30  ④ 16:30-18:40
 
 环境变量：
   FEISHU_APP_ID / FEISHU_APP_SECRET / ANTHROPIC_API_KEY
 """
 
-import json, os, time
+import json, os, time, random
 from datetime import datetime
 from pathlib import Path
+from copy import deepcopy
 
 import requests
 from flask import Flask, request, jsonify
@@ -53,13 +51,10 @@ anthropic = Anthropic(
 
 FEISHU_HOST = "https://open.feishu.cn"
 
-# 四个固定时段
-TIME_SLOTS = [
-    "09:30-11:30",
-    "12:30-14:30",
-    "14:30-16:30",
-    "16:30-18:40",
-]
+TIME_SLOTS = ["09:30-11:30", "12:30-14:30", "14:30-16:30", "16:30-18:40"]
+ROOM_LIST  = [f"Room {i}" for i in range(1, 31) if i not in (9, 11)]
+ENGLISH_SUBS = {"vocabulary","1000","2000","4000","grammar","ielts","phonics","esl"}
+VOCAB_LEVELS = {"1000","2000","4000"}
 
 # ──────────────────────── 数据读写 ────────────────────────
 def load_json(path: Path, default=None):
@@ -74,7 +69,7 @@ def save_json(path: Path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_schedule():
-    return load_json(SCHEDULE_FILE, {"students": [], "teachers": [], "slots": {}, "attendance": {}})
+    return load_json(SCHEDULE_FILE, {"students": [], "teachers": [], "slots": {}, "attendance": {}, "excluded_teachers": {}})
 
 def save_schedule(data):
     save_json(SCHEDULE_FILE, data)
@@ -108,53 +103,456 @@ def send_feishu_msg(open_id: str, text: str):
         print(f"[飞书] 发送失败: {result}")
     return result
 
-# ──────────────────────── 学生/考勤格式化 ────────────────────────
+# ──────────────────────────── 排课算法核心 ────────────────────────────
+
+def is_match(teacher_sub: str, student_sub: str) -> bool:
+    """科目匹配逻辑，和网页端一致"""
+    ts = teacher_sub.strip().lower()
+    ss = student_sub.strip().lower()
+    if ts == ss:
+        return True
+    if ts == "vocabulary" and ss in VOCAB_LEVELS:
+        return True
+    if ss == "vocabulary" and ts in VOCAB_LEVELS:
+        return True
+    return False
+
+def is_english_subject(subj: str) -> bool:
+    return subj.strip().lower() in ENGLISH_SUBS
+
+def get_group_key(subject: str, grade: int) -> str:
+    """组班 key：英语类跨年级，非英语必须同年级；词汇课按等级"""
+    s = subject.strip().lower()
+    if s in VOCAB_LEVELS:
+        return s  # 1000 只和 1000，2000 只和 2000
+    if is_english_subject(s):
+        return s  # ESL, Grammar 等可跨年级
+    return f"{s}_{grade}"  # 数学、物理等必须同年级
+
+def schedule_slot(students: list, teachers: list, time_text: str,
+                  max_class_student: int = 4, excluded_teachers: set = None) -> dict:
+    """
+    核心排课算法（翻译自网页端 JS）
+
+    返回: {
+        "result": [{学生名单, 老师, 科目, 教室, 时段, 人数, type, grade}],
+        "failNames": [...],
+        "idleTeachers": [...],
+        "placedCount": int
+    }
+    """
+    if excluded_teachers is None:
+        excluded_teachers = set()
+
+    # 过滤掉排除的老师
+    teachers = [t for t in teachers if t['name'] not in excluded_teachers]
+
+    room_idx = [0]
+    def get_room():
+        r = ROOM_LIST[room_idx[0] % len(ROOM_LIST)]
+        room_idx[0] += 1
+        return r
+
+    result = []
+    # 复制学生列表，添加状态字段
+    all_students = []
+    for s in students:
+        prefer_tea = s.get("preferTea", "") or ""
+        subs = (s["Subject"] + "").split("/")
+        subs = [x.strip() for x in subs if x.strip()]
+        all_students.append({
+            "name": s["Student"],
+            "grade": int(s.get("Grade", 0)),
+            "subjects": subs,
+            "stu_type": (s.get("Type", "group") or "group").strip(),
+            "preferTea": prefer_tea,
+            "placed": False,
+            "matchedTeacher": None,
+            "matchedSubject": None,
+        })
+
+    # 获取每个老师的候选学生
+    lv_rank_desc = {"high": 0, "mid": 1, "low": 2}
+    lv_rank_asc  = {"high": 0, "mid": 1, "low": 2}
+    all_teachers = [{"name": t["name"], "subjects": t.get("subjects", []),
+                      "level": t.get("level", "mid"), "busy": False} for t in teachers]
+    all_teachers.sort(key=lambda t: (lv_rank_desc.get(t["level"], 1), t["name"]))
+
+    def get_candidates(stu):
+        candidates = []
+        for tea in all_teachers:
+            for sub in stu["subjects"]:
+                for ts in tea["subjects"]:
+                    ts_sub = ts.get("subject", ts) if isinstance(ts, dict) else ts
+                    max_grade = ts.get("maxGrade", 99) if isinstance(ts, dict) else 99
+                    if is_match(ts_sub, sub) and stu["grade"] <= max_grade:
+                        candidates.append({"teacher": tea, "subject": sub})
+                        break
+        candidates.sort(key=lambda c: lv_rank_asc.get(c["teacher"]["level"], 1))
+        return candidates
+
+    # ── 分组 ──
+    p1_stus = [s for s in all_students if s["stu_type"] == "1v1" and s["preferTea"]]
+    p2_stus = [s for s in all_students if s["stu_type"] != "1v1" and s["preferTea"]]
+    p3_stus = [s for s in all_students if s["stu_type"] == "1v1" and not s["preferTea"]]
+    p4_stus = [s for s in all_students if s["stu_type"] != "1v1" and not s["preferTea"]]
+
+    reserved_teachers = set()   # P1/P2 预留
+    locked_teachers = set()     # P3 1v1 独占
+    match_map = {}
+
+    # ── P1: 1v1 + 指定老师 ──
+    p1_by_tea = {}
+    for stu in p1_stus:
+        tea = next((t for t in all_teachers if t["name"] == stu["preferTea"]), None)
+        if not tea: continue
+        ok_sub = None
+        for sub in stu["subjects"]:
+            for ts in tea["subjects"]:
+                ts_sub = ts.get("subject", ts) if isinstance(ts, dict) else ts
+                max_grade = ts.get("maxGrade", 99) if isinstance(ts, dict) else 99
+                if is_match(ts_sub, sub) and stu["grade"] <= max_grade:
+                    ok_sub = sub; break
+            if ok_sub: break
+        if not ok_sub: continue
+        key = tea["name"]
+        if key not in p1_by_tea:
+            p1_by_tea[key] = {"tea": tea, "pairs": []}
+        p1_by_tea[key]["pairs"].append((stu, ok_sub))
+        reserved_teachers.add(tea["name"])
+
+    for tea_name, entry in p1_by_tea.items():
+        tea = entry["tea"]
+        by_sub = {}
+        for stu, sub in entry["pairs"]:
+            by_sub.setdefault(sub, []).append(stu)
+        for sub, stus in by_sub.items():
+            names = "、".join(s["name"] for s in stus)
+            result.append({
+                "时段": time_text, "教室": get_room(), "老师": tea_name, "科目": sub,
+                "人数": len(stus), "type": "1v1", "grade": stus[0]["grade"], "学生名单": names
+            })
+            for s in stus:
+                s["placed"] = True; s["matchedTeacher"] = tea; s["matchedSubject"] = sub
+        tea["busy"] = True
+
+    # ── P2: 班课 + 指定老师 ──
+    p2_by_tea_sub = {}
+    for stu in p2_stus:
+        tea = next((t for t in all_teachers if t["name"] == stu["preferTea"]), None)
+        if not tea: continue
+        ok_sub = None
+        for sub in stu["subjects"]:
+            for ts in tea["subjects"]:
+                ts_sub = ts.get("subject", ts) if isinstance(ts, dict) else ts
+                max_grade = ts.get("maxGrade", 99) if isinstance(ts, dict) else 99
+                if is_match(ts_sub, sub) and stu["grade"] <= max_grade:
+                    ok_sub = sub; break
+            if ok_sub: break
+        if not ok_sub: continue
+        key = f"{tea['name']}||{ok_sub}"
+        if key not in p2_by_tea_sub:
+            p2_by_tea_sub[key] = {"tea": tea, "sub": ok_sub, "stus": []}
+        p2_by_tea_sub[key]["stus"].append(stu)
+        reserved_teachers.add(tea["name"])
+
+    for entry in p2_by_tea_sub.values():
+        tea = entry["tea"]
+        sub = entry["sub"]
+        stus = entry["stus"]
+        tea["busy"] = True
+        for i in range(0, len(stus), max_class_student):
+            batch = stus[i:i+max_class_student]
+            names = "、".join(s["name"] for s in batch)
+            result.append({
+                "时段": time_text, "教室": get_room(), "老师": tea["name"], "科目": sub,
+                "人数": len(batch), "type": "group", "grade": batch[0]["grade"], "学生名单": names
+            })
+            for s in batch:
+                s["placed"] = True; s["matchedTeacher"] = tea; s["matchedSubject"] = sub
+
+    # ── P3: 1v1 + 无指定 → 匈牙利算法 ──
+    def augment_1v1(stu, visited):
+        for c in get_candidates(stu):
+            tea = c["teacher"]
+            if tea["name"] in visited: continue
+            if tea["name"] in reserved_teachers: continue
+            visited.add(tea["name"])
+            if tea["name"] not in match_map:
+                match_map[tea["name"]] = (stu, c["subject"])
+                return True
+            prev_stu, _ = match_map[tea["name"]]
+            if augment_1v1(prev_stu, visited):
+                match_map[tea["name"]] = (stu, c["subject"])
+                return True
+        return False
+
+    p3_stus.sort(key=lambda s: len(get_candidates(s)))
+    for stu in p3_stus:
+        augment_1v1(stu, set())
+
+    for tea_name, (stu, sub) in match_map.items():
+        tea = next(t for t in all_teachers if t["name"] == tea_name)
+        stu["matchedTeacher"] = tea; stu["matchedSubject"] = sub
+        tea["busy"] = True; locked_teachers.add(tea_name)
+
+    for stu in p3_stus:
+        if stu.get("matchedTeacher"):
+            result.append({
+                "时段": time_text, "教室": get_room(), "老师": stu["matchedTeacher"]["name"],
+                "科目": stu["matchedSubject"], "人数": 1, "type": "1v1",
+                "grade": stu["grade"], "学生名单": stu["name"]
+            })
+            stu["placed"] = True
+
+    match_map.clear()
+
+    # ── P4: 班课 + 无指定 → 匈牙利算法 ──
+    def augment(stu, visited):
+        for c in get_candidates(stu):
+            tea = c["teacher"]
+            if tea["name"] in visited: continue
+            if tea["name"] in reserved_teachers: continue
+            if tea["name"] in locked_teachers: continue
+            if tea["busy"]: continue
+            visited.add(tea["name"])
+            if tea["name"] not in match_map or augment(match_map[tea["name"]][0], visited):
+                match_map[tea["name"]] = (stu, c["subject"])
+                return True
+        return False
+
+    p4_stus.sort(key=lambda s: len(get_candidates(s)))
+    for stu in p4_stus:
+        augment(stu, set())
+
+    for tea_name, (stu, sub) in match_map.items():
+        tea = next(t for t in all_teachers if t["name"] == tea_name)
+        stu["matchedTeacher"] = tea; stu["matchedSubject"] = sub
+        tea["busy"] = True
+
+    for stu in p4_stus:
+        if stu.get("matchedTeacher") and not stu["placed"]:
+            result.append({
+                "时段": time_text, "教室": get_room(), "老师": stu["matchedTeacher"]["name"],
+                "科目": stu["matchedSubject"], "人数": 1, "type": "group",
+                "grade": stu["grade"], "学生名单": stu["name"]
+            })
+            stu["placed"] = True
+
+    # ── 未排班课学生 → 合入已有班级 ──
+    unmatched = [s for s in all_students if not s["placed"] and s["stu_type"] != "1v1"]
+    for stu in unmatched:
+        for sub in stu["subjects"]:
+            key = get_group_key(sub, stu["grade"])
+            open_classes = [c for c in result
+                if c.get("type") != "1v1"
+                and get_group_key(c["科目"], c["grade"]) == key
+                and len(c["学生名单"].split("、")) < max_class_student
+                and stu["name"] not in c["学生名单"].split("、")]
+            open_classes.sort(key=lambda c: c["人数"])
+            if open_classes:
+                cls = open_classes[0]
+                names = cls["学生名单"].split("、") + [stu["name"]]
+                cls["学生名单"] = "、".join(names)
+                cls["人数"] = len(names)
+                stu["placed"] = True; break
+
+    # ── 仍未排 → 找空闲老师新开班 → 最后手段扩展搜索 ──
+    still_failed = [s for s in all_students if not s["placed"] and s["stu_type"] != "1v1"]
+    for stu in still_failed:
+        merged = False
+        for sub in stu["subjects"]:
+            key = get_group_key(sub, stu["grade"])
+            open_classes = [c for c in result
+                if c.get("type") != "1v1"
+                and get_group_key(c["科目"], c["grade"]) == key
+                and len(c["学生名单"].split("、")) < max_class_student
+                and stu["name"] not in c["学生名单"].split("、")]
+            if open_classes:
+                open_classes.sort(key=lambda c: c["人数"])
+                cls = open_classes[0]
+                names = cls["学生名单"].split("、") + [stu["name"]]
+                cls["学生名单"] = "、".join(names)
+                cls["人数"] = len(names)
+                stu["placed"] = True; merged = True; break
+        if merged: continue
+
+        # 找空闲老师
+        for sub in stu["subjects"]:
+            free_tea = next((t for t in all_teachers
+                if not t["busy"] and t["name"] not in reserved_teachers
+                and t["name"] not in locked_teachers
+                and any(is_match(ts.get("subject",ts) if isinstance(ts,dict) else ts, sub)
+                        and stu["grade"] <= (ts.get("maxGrade",99) if isinstance(ts,dict) else 99)
+                        for ts in t["subjects"])), None)
+            if free_tea:
+                free_tea["busy"] = True
+                result.append({
+                    "时段": time_text, "教室": get_room(), "老师": free_tea["name"],
+                    "科目": sub, "人数": 1, "type": "group",
+                    "grade": stu["grade"], "学生名单": stu["name"]
+                })
+                stu["placed"] = True; break
+
+        # 最后手段：扩展现有班
+        if not stu["placed"]:
+            for sub in stu["subjects"]:
+                is_eng = is_english_subject(sub)
+                open_classes = [c for c in result
+                    if c.get("type") != "1v1"
+                    and is_match(c["科目"], sub)
+                    and (is_eng or c["grade"] == stu["grade"])
+                    and len(c["学生名单"].split("、")) < max_class_student
+                    and stu["name"] not in c["学生名单"].split("、")]
+                if open_classes:
+                    open_classes.sort(key=lambda c: c["人数"])
+                    cls = open_classes[0]
+                    names = cls["学生名单"].split("、") + [stu["name"]]
+                    cls["学生名单"] = "、".join(names)
+                    cls["人数"] = len(names)
+                    stu["placed"] = True; break
+
+    # ── 未排 1v1 学生 → 最后手段 ──
+    failed_1v1 = [s for s in all_students if not s["placed"] and s["stu_type"] == "1v1"]
+    for stu in failed_1v1:
+        for sub in stu["subjects"]:
+            free_tea = next((t for t in all_teachers
+                if not t["busy"] and t["name"] not in reserved_teachers
+                and t["name"] not in locked_teachers
+                and any(is_match(ts.get("subject",ts) if isinstance(ts,dict) else ts, sub)
+                        and stu["grade"] <= (ts.get("maxGrade",99) if isinstance(ts,dict) else 99)
+                        for ts in t["subjects"])), None)
+            if free_tea:
+                free_tea["busy"] = True
+                result.append({
+                    "时段": time_text, "教室": get_room(), "老师": free_tea["name"],
+                    "科目": sub, "人数": 1, "type": "1v1",
+                    "grade": stu["grade"], "学生名单": stu["name"]
+                })
+                stu["placed"] = True; break
+
+    all_failed    = [s for s in all_students if not s["placed"]]
+    idle_teachers = [t["name"] for t in all_teachers if not t["busy"]]
+
+    return {
+        "result": result,
+        "failCount": len(all_failed),
+        "failNames": [f"{s['name']}（{'/'.join(s['subjects'])}，G{s['grade']}）" for s in all_failed],
+        "idleTeachers": idle_teachers,
+        "placedCount": sum(1 for s in all_students if s["placed"])
+    }
+
+# ──────────────────────── 格式化输出 ────────────────────────
+
 def format_student_list(students: list) -> str:
-    """把学生列表格式化成可读消息"""
     lines = []
     for i, s in enumerate(students):
         lines.append(f"  {i+1}. {s['Student']} | G{s['Grade']} | {s['Subject']} | {s.get('Type','group')}")
     return "\n".join(lines)
 
-def format_attendance(attendance: dict, students: list) -> str:
-    """格式化今天的考勤状态"""
+def format_attendance(attendance: dict, students: list, excluded: dict) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     day_att = attendance.get(today, {})
+    day_exc = excluded.get(today, [])
 
-    name_map = {s['Student']: s for s in students}
-
-    lines = [f"📋 {today} 学生考勤："]
+    lines = [f"📋 {today} 选课情况："]
     for slot in TIME_SLOTS:
         names = day_att.get(slot, [])
         if names:
-            details = []
-            for n in names:
-                s = name_map.get(n, {})
-                details.append(f"{n}({s.get('Subject','?')})")
-            lines.append(f"  [{slot}] {' / '.join(details)}")
+            lines.append(f"  [{slot}] {len(names)}人：{', '.join(names)}")
         else:
             lines.append(f"  [{slot}] （未选）")
+    if day_exc:
+        lines.append(f"\n🚫 排除老师：{', '.join(day_exc)}")
     return "\n".join(lines)
 
+def format_schedule_result(result_data: dict, time_text: str) -> str:
+    """格式化排课结果"""
+    lines = [f"📋 [{time_text}] 排课结果："]
+    for c in result_data["result"]:
+        lines.append(f"  {c['教室']} | {c['老师']} | {c['科目']} | {c['学生名单']} | {c['type']}")
+    if result_data["failNames"]:
+        lines.append(f"\n⚠️ 未排入：{', '.join(result_data['failNames'])}")
+    if result_data["idleTeachers"]:
+        lines.append(f"📋 空闲老师：{', '.join(result_data['idleTeachers'])}")
+    return "\n".join(lines)
+
+def format_day_schedule(slots_data: dict, date: str) -> str:
+    """格式化整天的排课"""
+    if date not in slots_data:
+        return f"📭 {date} 没有排课记录"
+
+    day = slots_data[date]
+    # 按老师汇总
+    teacher_map = {}
+    for tk in sorted(day.keys()):
+        for c in day[tk].get("classes", []):
+            t = c.get("老师", "?")
+            teacher_map.setdefault(t, []).append({**c, "time": tk})
+
+    lines = [f"📋 {date} 总课表："]
+    for teacher in sorted(teacher_map.keys()):
+        entries = teacher_map[teacher]
+        rooms = list(set(e["教室"] for e in entries))
+        for e in entries:
+            lines.append(f"  {e['time']} | {e['教室']} | {teacher} | {e.get('科目','?')} | {e.get('学生名单','?')}")
+    return "\n".join(lines)
+
+def build_context(schedule_data: dict) -> str:
+    """构建给 AI 的精简上下文"""
+    students = schedule_data.get("students", [])
+    teachers = schedule_data.get("teachers", [])
+    slots = schedule_data.get("slots", {})
+    attendance = schedule_data.get("attendance", {})
+    excluded = schedule_data.get("excluded_teachers", {})
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    ctx = [f"当前日期: {today}"]
+    ctx.append(f"\n【学生 {len(students)} 人】")
+    for s in students[:20]:
+        ctx.append(f"  {s['Student']} | G{s['Grade']} | {s['Subject']} | {s.get('Type','group')}")
+    if len(students) > 20:
+        ctx.append(f"  ...共{len(students)}人")
+
+    ctx.append(f"\n【老师 {len(teachers)} 人】")
+    for t in teachers[:10]:
+        subs = ", ".join(f"{x.get('subject','?')}" if isinstance(x,dict) else str(x) for x in t.get("subjects", []))
+        ctx.append(f"  {t.get('name','?')} | {t.get('level','mid')} | {subs}")
+
+    ctx.append(f"\n【今日考勤】")
+    day_att = attendance.get(today, {})
+    day_exc = excluded.get(today, [])
+    for slot in TIME_SLOTS:
+        names = day_att.get(slot, [])
+        ctx.append(f"  [{slot}] {'、'.join(names) if names else '（未选）'}")
+    if day_exc:
+        ctx.append(f"  排除老师: {'、'.join(day_exc)}")
+
+    ctx.append(f"\n【已排课: {len(slots)} 天】")
+    return "\n".join(ctx)
+
 # ──────────────────────── 操作执行 ────────────────────────
+
 def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
     action = op.get("action", "")
     slots = schedule_data.setdefault("slots", {})
     students = schedule_data.get("students", [])
+    teachers = schedule_data.get("teachers", [])
     attendance = schedule_data.setdefault("attendance", {})
+    excluded = schedule_data.setdefault("excluded_teachers", {})
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # ── list_students: 列出所有学生 ──
+    # ── list_students ──
     if action == "list_students":
         if not students:
             return "📭 还没有学生数据。请在电脑网页导入 Excel。", schedule_data
         return f"📋 学生列表（共 {len(students)} 人）：\n\n" + format_student_list(students), schedule_data
 
-    # ── show_attendance: 显示当天考勤 ──
+    # ── show_attendance ──
     if action == "show_attendance":
-        return format_attendance(attendance, students), schedule_data
+        return format_attendance(attendance, students, excluded), schedule_data
 
-    # ── select_students: 为一个时段选学生 ──
+    # ── select_students ──
     if action == "select_students":
         slot_time = op.get("time", "")
         student_names_str = op.get("student_names", "")
@@ -163,85 +561,167 @@ def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
         if slot_time not in TIME_SLOTS:
             return f"⚠️ 无效时段。可选：{' / '.join(TIME_SLOTS)}", schedule_data
 
-        # 解析学生名（支持编号、逗号分隔、中文顿号分隔）
-        selected = _parse_student_names(student_names_str, students)
+        if student_names_str in ("全部", "所有人", "all", "所有"):
+            # 排除的老师不排
+            day_exc = excluded.get(date, [])
+            selected = [s['Student'] for s in students if s['Student'] not in day_exc]
+        else:
+            selected = _parse_names(student_names_str, students)
 
         if not selected:
-            return "⚠️ 没有识别到有效学生名。请重新输入，如：David, Yufei, Eva", schedule_data
+            return "⚠️ 没有识别到有效学生名", schedule_data
 
         attendance.setdefault(date, {})[slot_time] = selected
-        return f"✅ {date} [{slot_time}] 已选 {len(selected)} 人：{', '.join(selected)}\n\n" + format_attendance(attendance, students), schedule_data
+        msg = f"✅ {date} [{slot_time}] 已选 {len(selected)} 人：{', '.join(selected)}"
+        return msg + "\n\n" + format_attendance(attendance, students, excluded), schedule_data
 
-    # ── clear_slot: 清空某时段 ──
+    # ── clear_slot ──
     if action == "clear_slot":
         slot_time = op.get("time", "")
         date = op.get("date", today)
         if date in attendance and slot_time in attendance[date]:
             del attendance[date][slot_time]
-            return f"✅ 已清空 {date} [{slot_time}]\n\n" + format_attendance(attendance, students), schedule_data
-        return f"⚠️ {date} [{slot_time}] 本来就没有学生", schedule_data
+            return f"✅ 已清空 [{slot_time}]\n\n" + format_attendance(attendance, students, excluded), schedule_data
+        return f"⚠️ [{slot_time}] 没有学生", schedule_data
 
-    # ── add_student: 添加新学生 ──
+    # ── exclude_teacher ──
+    if action == "exclude_teacher":
+        name = op.get("teacher_name", "").strip()
+        date = op.get("date", today)
+        if not name:
+            return "⚠️ 请提供老师名", schedule_data
+        exc = excluded.setdefault(date, [])
+        if name not in exc:
+            exc.append(name)
+            return f"✅ 已排除 {name}\n\n" + format_attendance(attendance, students, excluded), schedule_data
+        return f"⚠️ {name} 已被排除", schedule_data
+
+    # ── include_teacher ──
+    if action == "include_teacher":
+        name = op.get("teacher_name", "").strip()
+        date = op.get("date", today)
+        exc = excluded.get(date, [])
+        if name in exc:
+            exc.remove(name)
+            return f"✅ 已恢复 {name}\n\n" + format_attendance(attendance, students, excluded), schedule_data
+        return f"⚠️ {name} 不在排除列表中", schedule_data
+
+    # ── auto_schedule ──
+    if action == "auto_schedule":
+        time_slot = op.get("time", "")
+        date = op.get("date", today)
+        subject_filter = op.get("subject", "")  # 可选：只排某科目
+
+        if time_slot and time_slot not in TIME_SLOTS:
+            return f"⚠️ 时段必须是: {' / '.join(TIME_SLOTS)}", schedule_data
+
+        day_att = attendance.get(date, {})
+        day_exc = excluded.get(date, [])
+
+        # 确定要排的时段
+        slots_to_schedule = [time_slot] if time_slot else [s for s in TIME_SLOTS if day_att.get(s)]
+
+        if not any(day_att.get(s) for s in slots_to_schedule):
+            return "⚠️ 还没有选学生。请先用「选学生」选好谁来上课。", schedule_data
+
+        if not teachers:
+            return "⚠️ 还没有老师数据。请在电脑网页导入。", schedule_data
+
+        all_results = []
+        total_failed = []
+        total_idle = []
+
+        for slot in slots_to_schedule:
+            names = day_att.get(slot, [])
+            if not names:
+                continue
+
+            # 筛选该时段的学生
+            slot_students = [s for s in students if s['Student'] in names]
+
+            # 如果指定了科目，只保留选该科目的学生
+            if subject_filter:
+                slot_students = [s for s in slot_students
+                    if subject_filter.lower() in [x.strip().lower() for x in (s.get("Subject","")+"").split("/")]]
+
+            if not slot_students:
+                all_results.append(f"[{slot}] 没有符合条件的学生")
+                continue
+
+            # 排除的老师
+            exc_set = set(day_exc)
+
+            r = schedule_slot(slot_students, teachers, slot,
+                              max_class_student=4, excluded_teachers=exc_set)
+
+            # 保存到 slots 数据
+            slots.setdefault(date, {})[slot] = {
+                "classes": r["result"],
+                "failCount": r["failCount"],
+                "idleTeachers": r["idleTeachers"],
+                "placedCount": r["placedCount"],
+            }
+
+            all_results.append(format_schedule_result(r, slot))
+            total_failed.extend(r["failNames"])
+            total_idle = list(set(total_idle + r["idleTeachers"]))
+
+        # 汇总消息
+        summary = f"🚀 {date} 排课完成！\n\n" + "\n\n".join(all_results)
+        if total_failed:
+            summary += f"\n\n⚠️ 总共 {len(total_failed)} 人未排入"
+        return summary, schedule_data
+
+    # ── add_student ──
     if action == "add_student":
         name = op.get("student_name", "").strip()
-        grade = op.get("grade", 0)
+        grade = int(op.get("grade", 0))
         subject = op.get("subject", "").strip()
-        stu_type = op.get("student_type", "group").strip()
+        stu_type = (op.get("student_type", "group") or "group").strip()
 
-        if not name:
-            return "⚠️ 请提供学生姓名。格式：添加学生：姓名, G年级, 科目/科目, 1v1或group", schedule_data
-        if not grade:
-            return "⚠️ 请提供年级（数字）。格式：添加学生：姓名, G5, 数学, group", schedule_data
-        if not subject:
-            return "⚠️ 请提供科目。格式：添加学生：姓名, G5, 数学/物理, group", schedule_data
-
-        # 查重
+        if not name or not grade or not subject:
+            return "⚠️ 格式：添加学生：姓名, G年级, 科目/科目, 1v1或group\n例：添加学生：张三, G5, 数学/物理, 1v1", schedule_data
         if any(s['Student'] == name for s in students):
-            return f"⚠️ 学生「{name}」已存在", schedule_data
+            return f"⚠️ 「{name}」已存在", schedule_data
 
         students.append({
-            "Student": name,
-            "Grade": int(grade),
-            "Subject": subject,
+            "Student": name, "Grade": int(grade), "Subject": subject,
             "Type": stu_type if stu_type in ("1v1", "group") else "group"
         })
-        return f"✅ 已添加学生：{name} | G{grade} | {subject} | {stu_type}", schedule_data
+        return f"✅ 已添加：{name} | G{grade} | {subject} | {stu_type}", schedule_data
 
-    # ── remove_student: 删除学生 ──
+    # ── remove_student ──
     if action == "remove_student":
         name = op.get("student_name", "").strip()
         for i, s in enumerate(students):
             if s['Student'] == name:
                 del students[i]
-                # 同时从考勤中移除
                 for d in attendance:
                     for slot in attendance[d]:
                         if name in attendance[d][slot]:
                             attendance[d][slot].remove(name)
-                # 从排课中移除
                 for d in slots:
                     for t in list(slots[d].keys()):
-                        for c in list(slots[d][t].get("classes", [])):
-                            names_in = [x.strip() for x in c.get("学生名单", "").split("、")]
+                        cls_list = slots[d][t].get("classes", [])
+                        for c in list(cls_list):
+                            names_in = [x.strip() for x in c.get("学生名单","").split("、")]
                             if name in names_in:
                                 new_names = [x for x in names_in if x != name]
-                                if new_names:
-                                    c["学生名单"] = "、".join(new_names)
-                                else:
-                                    slots[d][t]["classes"].remove(c)
-                        if not slots[d][t].get("classes"):
+                                if new_names: c["学生名单"] = "、".join(new_names)
+                                else: cls_list.remove(c)
+                        slots[d][t]["classes"] = [c for c in cls_list if c.get("学生名单")]
+                        if not slots[d][t]["classes"]:
                             del slots[d][t]
-                    if not slots[d]:
-                        del slots[d]
-                return f"✅ 已删除学生「{name}」（同时从考勤和排课中移除）", schedule_data
-        return f"⚠️ 未找到学生「{name}」", schedule_data
+                    if not slots[d]: del slots[d]
+                return f"✅ 已删除「{name}」", schedule_data
+        return f"⚠️ 未找到「{name}」", schedule_data
 
-    # ── 保留原有操作 ──
+    # ── 保留原有操作（不变）──
     if action == "query_student":
         name = op.get("student_name", "")
         found = _find_student_slots(schedule_data, name)
         if not found:
-            return f"📭 {name} 没有任何排课记录", schedule_data
+            return f"📭 {name} 无排课记录", schedule_data
         lines = [f"📋 {name} 的课表："]
         for f in found:
             lines.append(f"  • {f['date']} {f['time']} | {f.get('科目','?')} | {f.get('老师','?')} | {f.get('教室','?')}")
@@ -255,8 +735,7 @@ def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
                 for c in slot.get("classes", []):
                     if c.get("老师") == name:
                         found.append({**c, "date": d, "time": tk})
-        if not found:
-            return f"📭 {name} 没有排课", schedule_data
+        if not found: return f"📭 {name} 无排课", schedule_data
         lines = [f"📋 {name} 的课表："]
         for f in found:
             lines.append(f"  • {f['date']} {f['time']} | {f.get('科目','?')} | {f.get('学生名单','?')} | {f.get('教室','?')}")
@@ -264,17 +743,7 @@ def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
 
     if action == "query_day":
         date = op.get("date", today)
-        if date not in slots:
-            # 如果没排课但有考勤，显示考勤
-            if date in attendance:
-                return format_attendance(attendance, students), schedule_data
-            return f"📭 {date} 没有排课记录", schedule_data
-        day = slots[date]
-        lines = [f"📋 {date} 课表："]
-        for tk in sorted(day.keys()):
-            for c in day[tk].get("classes", []):
-                lines.append(f"  • [{tk}] {c.get('科目','?')} | {c.get('老师','?')} | {c.get('学生名单','?')} | {c.get('教室','?')}")
-        return "\n".join(lines), schedule_data
+        return format_day_schedule(slots, date), schedule_data
 
     if action == "remove_class":
         student = op.get("student_name", "")
@@ -283,26 +752,23 @@ def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
         subject = op.get("subject", "")
         if date in slots and time_key in slots[date]:
             classes = slots[date][time_key].get("classes", [])
-            kept, removed = [], []
+            kept = []
             for c in classes:
-                names = [s.strip() for s in c.get("学生名单", "").split("、")]
+                names = [s.strip() for s in c.get("学生名单","").split("、")]
                 if student in names:
                     if subject and c.get("科目") != subject:
                         kept.append(c); continue
                     new_names = [s for s in names if s != student]
                     if new_names:
-                        c["学生名单"] = "、".join(new_names)
-                        kept.append(c)
-                    removed.append(c)
+                        c["学生名单"] = "、".join(new_names); kept.append(c)
                 else:
                     kept.append(c)
             slots[date][time_key]["classes"] = kept
             if not kept:
                 del slots[date][time_key]
                 if not slots[date]: del slots[date]
-            if removed:
-                return f"✅ 已取消 {student} 在 {date} {time_key} 的{subject or '课'}", schedule_data
-        return f"⚠️ 未找到匹配的课", schedule_data
+            return f"✅ 已取消 {student} 在 {date} {time_key} 的{subject or '课'}", schedule_data
+        return "⚠️ 未找到匹配的课", schedule_data
 
     if action == "add_class":
         student = op.get("student_name", "")
@@ -311,18 +777,18 @@ def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
         subject = op.get("subject", "")
         teacher = op.get("teacher_name", "")
         if not all([student, date, time_key, subject]):
-            return "⚠️ 信息不足：学生名、日期、时段、科目", schedule_data
+            return "⚠️ 信息不足", schedule_data
         slots.setdefault(date, {}).setdefault(time_key, {"classes": []})
         for c in slots[date][time_key]["classes"]:
-            if student in [s.strip() for s in c.get("学生名单", "").split("、")]:
-                return f"⚠️ {student} 在 {date} {time_key} 已有课", schedule_data
-        used_rooms = {c.get("教室") for c in slots[date][time_key]["classes"]}
-        room = next((f"Room {i}" for i in range(1, 31) if f"Room {i}" not in used_rooms), "Room 1")
+            if student in [s.strip() for s in c.get("学生名单","").split("、")]:
+                return f"⚠️ {student} 已有课", schedule_data
+        used = {c.get("教室") for c in slots[date][time_key]["classes"]}
+        room = next((f"Room {i}" for i in range(1,31) if f"Room {i}" not in used), "Room 1")
         slots[date][time_key]["classes"].append({
             "学生名单": student, "老师": teacher or "待分配",
             "科目": subject, "教室": room, "时段": time_key,
         })
-        return f"✅ 已添加：{student} | {subject} | {date} {time_key} | {teacher or '待分配'} | {room}", schedule_data
+        return f"✅ 已添加：{student} | {subject} | {date} {time_key}", schedule_data
 
     if action == "move_class":
         student = op.get("student_name", "")
@@ -335,14 +801,13 @@ def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
         found = None
         if from_date in slots and from_time in slots[from_date]:
             for c in slots[from_date][from_time].get("classes", []):
-                if student in [s.strip() for s in c.get("学生名单", "").split("、")]:
+                if student in [s.strip() for s in c.get("学生名单","").split("、")]:
                     found = c; break
         if not found:
-            return f"⚠️ 未找到 {student} 在 {from_date} {from_time} 的课", schedule_data
-        old_names = [s.strip() for s in found.get("学生名单", "").split("、")]
+            return f"⚠️ 未找到", schedule_data
+        old_names = [s.strip() for s in found.get("学生名单","").split("、")]
         new_old = [s for s in old_names if s != student]
-        if new_old:
-            found["学生名单"] = "、".join(new_old)
+        if new_old: found["学生名单"] = "、".join(new_old)
         else:
             slots[from_date][from_time]["classes"].remove(found)
             if not slots[from_date][from_time]["classes"]:
@@ -352,46 +817,35 @@ def execute_operation(schedule_data: dict, op: dict) -> tuple[str, dict]:
         used = {c.get("教室") for c in slots[to_date][to_time]["classes"]}
         room = found.get("教室") if found.get("教室") not in used else next((f"Room {i}" for i in range(1,31) if f"Room {i}" not in used), "Room 1")
         slots[to_date][to_time]["classes"].append({
-            "学生名单": student, "老师": found.get("老师", "待分配"),
-            "科目": found.get("科目", ""), "教室": room, "时段": to_time,
+            "学生名单": student, "老师": found.get("老师","待分配"),
+            "科目": found.get("科目",""), "教室": room, "时段": to_time,
         })
         return f"✅ 已移动：{student} {found.get('科目','')} | {from_date} {from_time} → {to_date} {to_time}", schedule_data
 
     if action == "chat":
         return op.get("message", "好的👌"), schedule_data
 
-    return f"⚠️ 不支持的操作: {action}", schedule_data
+    return f"⚠️ 不支持: {action}", schedule_data
 
-def _parse_student_names(text: str, students: list) -> list:
-    """把用户输入解析为学生名列表（支持编号、逗号、顿号分隔）"""
-    known_names = {s['Student'] for s in students}
-    result = []
-
-    # 分割：逗号、顿号、空格、中文逗号
+def _parse_names(text: str, students: list) -> list:
+    """解析学生名（支持编号、逗号、顿号）"""
+    known = {s['Student']: s['Student'] for s in students}
+    known_lower = {k.lower(): k for k in known}
     parts = text.replace("，", ",").replace("、", ",").replace("\n", ",").split(",")
     parts = [p.strip() for p in parts if p.strip()]
-
+    result = []
     for p in parts:
-        # 尝试当作编号
         try:
             idx = int(p) - 1
             if 0 <= idx < len(students):
                 result.append(students[idx]['Student'])
                 continue
-        except ValueError:
-            pass
-        # 尝试直接匹配名字（大小写不敏感）
-        for name in known_names:
-            if name.lower() == p.lower():
-                result.append(name)
-                break
-        else:
-            # 部分匹配
-            matches = [n for n in known_names if p.lower() in n.lower()]
-            if len(matches) == 1:
-                result.append(matches[0])
-
-    # 去重保持顺序
+        except: pass
+        if p in known: result.append(p); continue
+        match = known_lower.get(p.lower())
+        if match: result.append(match); continue
+        matches = [v for k, v in known_lower.items() if p.lower() in k]
+        if len(matches) == 1: result.append(matches[0])
     seen = set()
     return [x for x in result if not (x in seen or seen.add(x))]
 
@@ -400,80 +854,45 @@ def _find_student_slots(schedule_data: dict, name: str) -> list:
     for d, day_data in schedule_data.get("slots", {}).items():
         for tk, slot in day_data.items():
             for c in slot.get("classes", []):
-                if name in [s.strip() for s in c.get("学生名单", "").split("、")]:
+                if name in [s.strip() for s in c.get("学生名单","").split("、")]:
                     results.append({**c, "date": d, "time": tk})
     return results
 
-# ──────────────────────── AI 上下文格式化 ────────────────────────
-def build_context(schedule_data: dict) -> str:
-    """构建给 AI 看的精简上下文"""
-    students = schedule_data.get("students", [])
-    teachers = schedule_data.get("teachers", [])
-    slots = schedule_data.get("slots", {})
-    attendance = schedule_data.get("attendance", {})
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    ctx = [f"=== 排课数据 ===\n当前日期: {today}"]
-    ctx.append(f"\n【学生 {len(students)} 人】")
-    for s in students:
-        ctx.append(f"  {s['Student']} | G{s['Grade']} | {s['Subject']} | {s.get('Type','group')}")
-
-    ctx.append(f"\n【老师 {len(teachers)} 人】")
-    for t in teachers[:5]:
-        subs = ", ".join(f"{x.get('subject','?')}" for x in t.get("subjects", []))
-        ctx.append(f"  {t.get('name','?')} | {t.get('level','mid')} | {subs}")
-
-    ctx.append(f"\n【今日考勤】")
-    if today in attendance:
-        for slot in TIME_SLOTS:
-            names = attendance[today].get(slot, [])
-            ctx.append(f"  [{slot}] {'、'.join(names) if names else '（未选）'}")
-    else:
-        ctx.append("  （今天还没选学生）")
-
-    ctx.append(f"\n【已排课日期: {len(slots)} 个】")
-    for d in sorted(slots.keys())[-3:]:  # 最近 3 天
-        day_data = slots[d]
-        for tk in sorted(day_data.keys()):
-            for c in day_data[tk].get("classes", []):
-                ctx.append(f"  {d} [{tk}] {c.get('科目','?')} | {c.get('老师','?')} | {c.get('学生名单','?')}")
-
-    return "\n".join(ctx)
-
 # ──────────────────────── Claude 解析 ────────────────────────
-SYSTEM_PROMPT = """你是 UTU 排课系统的 AI 助手。学生名和老师名通常用英文。
 
-四个时段（固定）：
-  ① 09:30-11:30  ② 12:30-14:30  ③ 14:30-16:30  ④ 16:30-18:40
+SYSTEM_PROMPT = """你是 UTU 排课系统的 AI 助手。学生名和老师名通常用英文（如 David, Tere）。
 
-你帮用户做三件事：
+核心功能流程：
 
-━━━ 选学生（考勤）━━━
-用户每天选择哪些学生来哪个时段。这是核心功能。
-- "今天选学生" / "开始排课" / "选人" → 列出全部学生和四个时段当前状态
-- "9:30-11:30: David, Yufei, Eva" → 给该时段选人
-- "12:30-14:30: 全部学生" → 全选
-- "14:30-16:30: 1,3,5,7" → 支持编号
-- "清空 9:30-11:30" → clear_slot
-- "查看考勤" → show_attendance
+━━━ ① 选学生 ━━━
+"9:30-11:30: David, Yufei, Eva" → select_students
+"全部学生在12:30-14:30" → select_students with student_names="全部"
+"14:30-16:30: 1,3,5,7" → select_students（支持编号）
+"查看考勤" → show_attendance
+"清空 9:30-11:30" → clear_slot
 
-━━━ 学生管理 ━━━
-- "添加学生：张三, G5, 数学/物理, 1v1" → add_student
-- "删除李四" → remove_student（同时从考勤和排课中移除）
-- "有哪些学生" → list_students
+━━━ ② 排除/恢复老师 ━━━
+默认所有老师可用。用户可以说：
+"王老师不排" / "排除 Tere" → exclude_teacher
+"恢复 Tere" / "让王老师也排" → include_teacher
 
-━━━ 排课操作 ━━━
-- "查看张三的课表" → query_student
-- "给今天来的学生排英语课" → 查看考勤后逐个 add_class
-- "取消张三今天的课" → remove_class
-- "把李四的课调到下午" → move_class
+━━━ ③ 自动排课 ━━━
+"自动排课" / "排课" / "开始排课" → auto_schedule（对所有已选时段排课）
+"只排 9:30-11:30" → auto_schedule with time="09:30-11:30"
+"排英语课" → auto_schedule with subject="英语相关科目"
+"给今天来的人排课" → auto_schedule
 
-注意：
-1. 日期用 YYYY-MM-DD。"今天"=当前日期
-2. 时段必须是四个之一
-3. 学生名/老师名要和数据里的严格匹配（大小写不敏感但尽量一致）
-4. 选学生时如果用户说"全部"、"所有人"，使用全部学生
-5. 不确定时反问用户，不要瞎编"""
+━━━ ④ 学生管理 ━━━
+"添加学生：Zhang, G5, Math, 1v1" → add_student
+"删除 Zhang" → remove_student
+"有哪些学生" → list_students
+
+━━━ ⑤ 微调 ━━━
+"查看 David 的课表" → query_student
+"取消 David 今天的课" → remove_class
+"查看今天课表" → query_day
+
+时段固定为: 09:30-11:30 / 12:30-14:30 / 14:30-16:30 / 16:30-18:40"""
 
 TOOL_SCHEMA = {
     "name": "schedule_operation",
@@ -485,19 +904,20 @@ TOOL_SCHEMA = {
                 "type": "string",
                 "enum": [
                     "list_students", "show_attendance", "select_students",
-                    "clear_slot", "add_student", "remove_student",
+                    "clear_slot", "exclude_teacher", "include_teacher",
+                    "auto_schedule", "add_student", "remove_student",
                     "query_student", "query_teacher", "query_day",
                     "add_class", "remove_class", "move_class", "chat"
                 ]
             },
             "student_name":   {"type": "string"},
-            "student_names":  {"type": "string", "description": "多个学生名，逗号或顿号分隔，支持编号如1,3,5"},
+            "student_names":  {"type": "string", "description": "多个学生名，逗号分隔，支持编号如1,3,5。'全部'=所有学生"},
             "teacher_name":   {"type": "string"},
             "subject":        {"type": "string"},
-            "student_type":   {"type": "string", "description": "1v1 或 group"},
+            "student_type":   {"type": "string"},
             "grade":          {"type": "integer"},
-            "date":           {"type": "string", "description": "YYYY-MM-DD"},
-            "time":           {"type": "string", "description": f"时段: {' / '.join(TIME_SLOTS)}"},
+            "date":           {"type": "string"},
+            "time":           {"type": "string"},
             "from_date":      {"type": "string"},
             "from_time":      {"type": "string"},
             "to_date":        {"type": "string"},
@@ -510,7 +930,7 @@ TOOL_SCHEMA = {
 
 def parse_command(user_msg: str, schedule_data: dict) -> dict:
     if not anthropic:
-        return {"action": "chat", "message": "🤖 服务器未配置 Anthropic API Key"}
+        return {"action": "chat", "message": "🤖 未配置 API Key"}
 
     context = build_context(schedule_data)
 
@@ -529,9 +949,9 @@ def parse_command(user_msg: str, schedule_data: dict) -> dict:
         return {"action": "chat", "message": text.strip() if text else "好的👌"}
     except Exception as e:
         print(f"[Claude] 错误: {e}")
-        return {"action": "chat", "message": f"⚠️ AI 出错: {str(e)[:200]}"}
+        return {"action": "chat", "message": f"⚠️ 出错: {str(e)[:200]}"}
 
-# ──────────────────────── API 路由（不变，网页端照常用） ────────────────────────
+# ──────────────────────── API 路由 ────────────────────────
 
 @app.route("/api/schedule", methods=["GET"])
 def api_get_schedule():
@@ -540,9 +960,10 @@ def api_get_schedule():
 @app.route("/api/schedule", methods=["POST"])
 def api_save_schedule():
     data = request.get_json(force=True)
-    # 保留已有的 attendance 数据（网页不会传这个字段）
     existing = get_schedule()
+    # 网页传上来的数据不覆盖考勤和排除信息
     data["attendance"] = existing.get("attendance", {})
+    data["excluded_teachers"] = existing.get("excluded_teachers", {})
     save_schedule(data)
     return jsonify({"ok": True})
 
@@ -563,7 +984,6 @@ def api_command():
 @app.route("/feishu/webhook", methods=["POST"])
 def feishu_webhook():
     body = request.get_json(force=True)
-
     if body.get("type") == "url_verification":
         return jsonify({"challenge": body.get("challenge", "")})
 
@@ -578,10 +998,7 @@ def feishu_webhook():
         user_msg = json.loads(msg.get("content", "{}")).get("text", "").strip()
     except:
         return jsonify({"ok": True})
-
     if not user_msg: return jsonify({"ok": True})
-
-    # 去掉群聊 @ 前缀
     if user_msg.startswith("@"):
         parts = user_msg.split(" ", 1)
         user_msg = parts[1] if len(parts) > 1 else ""
@@ -589,36 +1006,33 @@ def feishu_webhook():
     sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
     if not sender_id: return jsonify({"ok": True})
 
-    print(f"[飞书] {sender_id[:8]}... 说: {user_msg}")
+    print(f"[飞书] 说: {user_msg[:100]}")
 
-    schedule_data = get_schedule()
-    op = parse_command(user_msg, schedule_data)
-    reply, updated = execute_operation(schedule_data, op)
+    sd = get_schedule()
+    op = parse_command(user_msg, sd)
+    reply, updated = execute_operation(sd, op)
     save_schedule(updated)
 
-    # 飞书消息最长 5000 字符，超了截断
     if len(reply) > 4500:
-        reply = reply[:4500] + "\n\n...（内容过长已截断）"
+        reply = reply[:4500] + "\n\n...（截断）"
 
     send_feishu_msg(sender_id, reply)
     return jsonify({"ok": True})
 
-# ──────────────────────── 健康检查 ────────────────────────
+# ──────────────────────── 启动 ────────────────────────
 
 @app.route("/", methods=["GET"])
 def health():
     sd = get_schedule()
     return jsonify({
         "status": "ok",
-        "service": "UTU 排课系统 AI 助手",
-        "feishu_configured": bool(FEISHU_APP_ID and FEISHU_APP_SECRET),
-        "claude_configured": bool(ANTHROPIC_API_KEY),
+        "service": "UTU 排课系统",
+        "feishu": bool(FEISHU_APP_ID and FEISHU_APP_SECRET),
+        "claude": bool(ANTHROPIC_API_KEY),
         "students": len(sd.get("students", [])),
         "teachers": len(sd.get("teachers", [])),
         "slots": len(sd.get("slots", {})),
     })
-
-# ──────────────────────── 启动 ────────────────────────
 
 if __name__ == "__main__":
     print("🚀 UTU 排课 AI 助手启动中...")
