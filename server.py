@@ -1234,15 +1234,23 @@ def feishu_webhook():
         return jsonify({"ok": True})
 
     # ── 处理卡片按钮点击 ──
+    # 只有 header.event_type 为 card.action.trigger 才是卡片事件
+    # schema: "2.0" 可能会在多种事件中出现，不能单独用来判断
     header_type = body.get("header", {}).get("event_type", "")
-    schema = body.get("schema", "")
-    is_card_event = (header_type == "card.action.trigger" or schema.startswith("2."))
+    is_card_event = (header_type == "card.action.trigger")
+    has_message = "message" in event
 
-    _write_request_log({"is_card_event": is_card_event, "has_message": "message" in event})
+    _write_request_log({"is_card_event": is_card_event, "has_message": has_message,
+                        "header_type": header_type, "body_type": body.get("type", ""),
+                        "schema": body.get("schema", "")[:50]})
 
-    if is_card_event:
+    if is_card_event and not has_message:
         _write_request_log({"card_action": str(event.get("action", {}))[:300]})
         return _handle_card_action(sender_id, event.get("action", {}))
+
+    # 如果同时有卡片和消息，优先当消息处理
+    if is_card_event and has_message:
+        _write_request_log({"routing": "card+msg, treating as message"})
 
     # ── 处理消息文字 ──
     msg = event.get("message", {})
