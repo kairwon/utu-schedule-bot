@@ -1286,6 +1286,11 @@ def _write_request_log(entry: dict):
 def _handle_card_action(sender_id, action):
     """处理卡片按钮点击——value 格式: slot:09:30-11:30 / auto_schedule / query_day 等"""
     raw_value = action.get("value", "")
+    # 去掉可能的多余引号（飞书有时会给值加引号）
+    if isinstance(raw_value, str):
+        while (raw_value.startswith('"') and raw_value.endswith('"')) or \
+              (raw_value.startswith("'") and raw_value.endswith("'")):
+            raw_value = raw_value[1:-1]
     # 兼容旧格式（JSON）和新格式（纯字符串）
     if isinstance(raw_value, dict):
         # 已经是 dict
