@@ -1156,11 +1156,16 @@ def feishu_webhook():
 
     # ── 处理卡片按钮点击 ──
     header_type = body.get("header", {}).get("event_type", "")
-    if header_type == "card.action.trigger":
+    # 也检查 schema 版本
+    schema = body.get("schema", "")
+    if header_type == "card.action.trigger" or schema.startswith("2."):
+        print(f"[飞书] 卡片事件: header_type={header_type}, schema={schema}")
+        print(f"[飞书] action: {json.dumps(event.get('action', {}), ensure_ascii=False)[:500]}")
         return _handle_card_action(sender_id, event.get("action", {}))
 
     # ── 处理消息文字 ──
     msg = event.get("message", {})
+    print(f"[飞书] 非卡片事件: type={body.get('type','?')}, header_type={header_type}, msg_type={msg.get('message_type','?')}")
     if msg.get("message_type") != "text":
         return jsonify({"ok": True})
 
