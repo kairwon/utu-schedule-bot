@@ -1333,7 +1333,7 @@ def _handle_text_msg(sender_id, user_msg):
         # 不是学生名单，当作普通指令处理（fall through）
 
     # ── 快捷指令：直接发卡片 ──
-    if user_msg.strip() in ("菜单", "选学生", "开始", "排课菜单", "hi", "hello", "你好", "在吗"):
+    if user_msg.strip() in ("菜单", "选学生", "开始", "排课", "排课菜单", "hi", "hello", "你好", "在吗"):
         send_feishu_card(sender_id, build_main_card(
             sd.get("attendance", {}), sd.get("excluded_teachers", {}), sd.get("students", [])))
         return jsonify({"ok": True})
