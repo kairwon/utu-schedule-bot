@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制代码
 COPY server.py .
+COPY static/ static/
 RUN mkdir -p data
 
 # 用 gunicorn 运行（生产环境）
